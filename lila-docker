@@ -1,0 +1,209 @@
+#!/bin/bash -e
+
+run_setup() {
+    rust_cmd setup
+
+    docker compose build
+    docker compose --profile utils build
+    docker compose up -d
+    run_ui_build --update
+
+    setup_bbppairings
+    setup_database
+    rust_cmd welcome
+}
+
+run_start() {
+    if [ -z "$(docker compose ps -a --services | xargs)" ]; then
+        run_setup
+    else
+        if [ ! -z "$(docker compose ps -a --services --status=exited | xargs)" ]; then
+            COMPOSE_PROFILES=$(all_profiles) docker compose start
+        else
+            echo "There are no stopped services to resume"
+        fi
+    fi
+}
+
+run_stop() {
+    COMPOSE_PROFILES=$(all_profiles) docker compose stop
+}
+
+run_down() {
+    COMPOSE_PROFILES=$(all_profiles) docker compose down -v
+}
+
+all_profiles() {
+    # return all Docker Compose profiles as a comma-separated string
+    docker compose config --profiles | xargs | sed -e 's/ /,/g'
+}
+
+build_all_profiles() {
+    COMPOSE_PROFILES=$(all_profiles) docker compose pull
+    COMPOSE_PROFILES=$(all_profiles) docker compose build
+}
+
+run_ui_build() {
+    docker compose run --rm ui /lila/ui/build --clean --debug --split $@
+}
+
+setup_database() {
+    if [ "$SETUP_DATABASE" != "true" ]; then
+        echo "Skipping database setup"
+        return
+    fi
+
+    while ! docker compose exec mongodb mongo --eval "db.adminCommand('ping')" > /dev/null 2>&1; do
+        echo "Waiting for mongodb to be ready..."
+        sleep 1
+    done
+
+    docker compose run --rm python python /lila-db-seed/spamdb/spamdb.py \
+        --uri=mongodb://mongodb/lichess \
+        --drop-db \
+        --password=$PASSWORD \
+        --su-password=$SU_PASSWORD \
+        --streamers \
+        --coaches \
+        --tokens \
+        --es --es-host=elasticsearch:9200
+
+    echo "Creating database indexes..."
+    docker compose exec mongodb mongo --quiet lichess /lila/bin/mongodb/indexes.js
+    docker compose exec mongodb mongo --quiet lichess /lila/bin/mongodb/create-trophy-kinds.js
+    docker compose run --rm python python /scripts/users.py
+}
+
+setup_bbppairings() {
+    if [ "$SETUP_BBPPAIRINGS" != "true" ]; then
+        return
+    fi
+
+    docker build -f docker/bbpPairings.Dockerfile . -t bbppairings
+    docker run --rm -v ./repos/bbpPairings:/mnt bbppairings make
+
+    ## verify it compiled
+    ./repos/bbpPairings/bbpPairings.exe
+}
+
+reset_database() {
+    load_config_to_env
+    setup_database
+}
+
+run_formatter() {
+    docker compose run --rm -w /lila ui pnpm run format
+    docker compose exec chessground pnpm run format || echo "Skipping chessground"
+    docker compose exec pgn_viewer pnpm run format || echo "Skipping pgn-viewer"
+    docker compose exec lila sbt scalafmtAll || docker compose run --rm --entrypoint "sbt scalafmtAll" lila
+}
+
+run_hostname() {
+    rust_cmd hostname
+
+    if [ ! -z "$(docker compose ps -a --services | xargs)" ]; then
+        docker compose down lila lila_ws nginx
+        docker compose up -d lila lila_ws nginx
+    fi
+}
+
+run_mobile() {
+    rust_cmd mobile
+    docker compose exec mobile adb pair $PHONE_IP:$PAIRING_PORT $PAIRING_CODE
+    docker compose exec mobile adb connect $PHONE_IP:$CONNECTION_PORT
+}
+
+rust_cmd() {
+    if command -v rustup &> /dev/null; then
+        # if the host has Rust installed, use it directly
+        cargo build --release --manifest-path command/Cargo.toml
+        ./command/target/release/command "$@"
+    elif [ "$(uname)" = "Darwin" ]; then
+        docker run --rm -v "$PWD/command:/command" -w /command messense/cargo-zigbuild:0.18.3 \
+            cargo zigbuild --release --target universal2-apple-darwin
+        ./command/target/universal2-apple-darwin/release/command "$@"
+    else
+        docker run --rm -v "$PWD/command:/command" -w /command messense/cargo-zigbuild:0.18.3 \
+            cargo zigbuild --release
+        ./command/target/release/command "$@"
+    fi
+
+    load_config_to_env
+}
+
+load_config_to_env() {
+    export $(cat settings.env | xargs)
+}
+
+show_help() {
+    echo "Usage: $0 <action>"
+
+    echo "Actions:"
+    echo "  start         Start the containers"
+    echo "  stop          Stop the containers"
+    echo "  restart       Restart the containers"
+    echo "  down          Stop the containers and remove their volumes"
+    echo "  build         Pre-fetch and pre-build all the images necessary for the containers"
+    echo "  format        Run the code formatter to match Lichess code style"
+    echo "  hostname      Set the hostname to something different than the default localhost"
+    echo "  mobile        For mobile app development.Pair and connect to a mobile device"
+    echo "  flutter       Get the 'flutter run' command with the URL arguments pre-configured"
+    echo "  db            Reset and re-seed the database with fresh fake data"
+    echo "  lila clean    Run 'sbt clean' in the lila container. Useful if there are compilation errors"
+    echo "  lila restart  Restart the lila container to apply changes to the codebase"
+    echo "  gitpod public Make http port 8080 public on the Gitpod instance"
+    echo "  ui            Compile the frontend code. Runs in watch mode to automatically recompile on changes"
+}
+
+case "$@" in
+    --help|-h)
+        show_help
+        exit 0
+        ;;
+    start)
+        run_start
+        ;;
+    stop)
+        run_stop
+        ;;
+    restart)
+        run_stop && run_start
+        ;;
+    down)
+        run_down
+        ;;
+    build)
+        build_all_profiles
+        ;;
+    format)
+        run_formatter
+        ;;
+    hostname)
+        run_hostname
+        ;;
+    mobile)
+        run_mobile
+        ;;
+    db)
+        reset_database
+        ;;
+    "lila clean")
+        docker compose run --rm --entrypoint "sbt clean" lila
+        ;;
+    "lila restart")
+        docker compose restart lila
+        ;;
+    ui)
+        run_ui_build --rebuild
+        ;;
+    "gitpod public")
+        rust_cmd gitpod_public
+        ;;
+    "flutter")
+        rust_cmd flutter
+        ;;
+    *)
+        show_help
+        exit 1
+        ;;
+esac
